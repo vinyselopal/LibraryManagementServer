@@ -1,5 +1,5 @@
 from django.shortcuts import render
-
+from io import BytesIO
 from django.http import HttpResponse, JsonResponse
 from .models import Member, Transaction, Book
 
@@ -10,6 +10,8 @@ from django.core import serializers
 from django.views.decorators.csrf import csrf_exempt
 
 import json
+import requests
+import copy
 
 
 def index(request):
@@ -176,6 +178,46 @@ def charge_fee(request, member_id):
     return JsonResponse(
         {"message": serializers.serialize("json", response), "status": 204}
     )
+
+
+@csrf_exempt
+def import_books(request):
+    if request.method == "POST":
+        request_body = json.loads(request.body.decode("utf-8"))
+        title = request_body.get("title")
+        authors = request_body.get("authors")
+        isbn = request_body.get("isbn")
+        publisher = request_body.get("publisher")
+        page = request_body.get("page")
+
+        api_url = "https://frappe.io/api/method/frappe-library?"
+        if title:
+            api_url = api_url + f"title={title}"
+        if authors:
+            api_url = api_url + f"authors={authors}"
+        if isbn:
+            api_url = api_url + f"isbn={isbn}"
+        if publisher:
+            api_url = api_url + f"publisher={publisher}"
+        if page:
+            api_url = api_url + f"page={page}"
+
+        response = requests.get(api_url)
+        print(response.content)
+        data = BytesIO(response.content)
+        deserialized_data = json.load(data)
+        books = deserialized_data['message']
+
+        cleaned_books = []
+        keys_mapping = {'  num_pages': 'num_pages', 'bookID': 'id'}
+        for book in books:
+            cleaned_book = {keys_mapping.get(key, key): value for key, value in book.items()}
+            cleaned_books.append(cleaned_book)
+
+        book_objects = [Book(**book) for book in cleaned_books]
+
+
+        Book.objects.bulk_create(book_objects)
 
 
 # Create your views here.

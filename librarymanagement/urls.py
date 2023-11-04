@@ -14,4 +14,5 @@ urlpatterns = [
     path("members/<int:member_id>/charge_fee", views.charge_fee),
     path("books", views.books_index),
     path("books/<int:book_id>", views.crud_book),
+    path("books/import_books", views.import_books),
 ]
