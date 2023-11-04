@@ -2,6 +2,8 @@ from django.shortcuts import render
 from io import BytesIO
 from django.http import HttpResponse, JsonResponse
 from .models import Member, Transaction, Book
+from datetime import datetime
+from django.db import IntegrityError
 
 from django.db.models import F, ExpressionWrapper, fields
 from django.utils import timezone
@@ -203,21 +205,27 @@ def import_books(request):
             api_url = api_url + f"page={page}"
 
         response = requests.get(api_url)
-        print(response.content)
         data = BytesIO(response.content)
         deserialized_data = json.load(data)
         books = deserialized_data['message']
 
         cleaned_books = []
+
         keys_mapping = {'  num_pages': 'num_pages', 'bookID': 'id'}
         for book in books:
             cleaned_book = {keys_mapping.get(key, key): value for key, value in book.items()}
+            cleaned_book['rent'] = 50
             cleaned_books.append(cleaned_book)
 
         book_objects = [Book(**book) for book in cleaned_books]
 
+        for book in book_objects:
+            try:
+                book.save()
+            except IntegrityError:
+                pass
 
-        Book.objects.bulk_create(book_objects)
+        return JsonResponse({"message": "Books imported successfully", "status": 201})
 
 
 # Create your views here.
