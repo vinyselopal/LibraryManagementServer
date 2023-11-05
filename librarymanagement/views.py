@@ -5,7 +5,7 @@ from .models import Member, Transaction, Book
 from datetime import datetime
 from django.db import IntegrityError
 
-from django.db.models import F, ExpressionWrapper, fields
+from django.db.models import F, ExpressionWrapper, fields, Case, When
 from django.utils import timezone
 from django.db.models import Sum
 from django.core import serializers
@@ -127,29 +127,43 @@ def issue_book(request, member_id):
         member_id=member_id, payment_done=False
     ).annotate(
         transaction_fee=ExpressionWrapper(
-            (F("return_date") - F("issue_date")) * F("book__rent"),
-            output_field=fields.DecimalField(),
-        )
-        if F("return_date") != None
-        else ExpressionWrapper(
-            (timezone.now() - F("issue_date")) * F("book__rent"),
+            Case(
+                When(
+                    return_date__isnull=False, then=(F("return_date") - F("issue_date"))
+                ),
+                default=(timezone.now().date() - F("issue_date")),
+                output_field=fields.DurationField(),
+            )
+            * F("book__rent"),
             output_field=fields.DecimalField(),
         )
     )
+
     outstanding_debt = transaction_fee_queryset.aggregate(debt=Sum("transaction_fee"))[
         "debt"
     ]
 
-    if outstanding_debt > 500:
+    book_quantity = Book.objects.get(id=book_id).quantity
+    print(book_quantity)
+    books_issued = Transaction.objects.filter(book_id=book_id, return_date=None).count()
+    books_unissued = book_quantity - books_issued
+    # check quantity of the book - no. of times that book is issued
+
+    for t in transaction_fee_queryset:
+        print("t", vars(t))
+
+    if transaction_fee_queryset and outstanding_debt > 500:
         return JsonResponse({"message": "Outstanding debt overflow", "status": 409})
+
+    if books_unissued == 0:
+        return JsonResponse({"message": "Book not available", "status": 409})
 
     else:
         response = Transaction.objects.create(
             member_id=member_id, book_id=book_id, issue_date=issue_date
         )
-        return JsonResponse(
-            {"message": serializers.serialize("json", response), "status": 201}
-        )
+        if isinstance(response, Transaction):
+            return JsonResponse({"message": "new transaction created", "status": 201})
 
 
 @csrf_exempt
@@ -162,9 +176,8 @@ def return_book(request, member_id):
     response = Transaction.objects.filter(member_id=member_id, book_id=book_id).update(
         return_date=return_date
     )
-    return JsonResponse(
-        {"message": serializers.serialize("json", response), "status": 204}
-    )
+    if isinstance(response, int):
+        return JsonResponse({"message": "transaction updated", "status": 204})
 
 
 @csrf_exempt
@@ -177,9 +190,8 @@ def charge_fee(request, member_id):
         payment_done=True
     )
 
-    return JsonResponse(
-        {"message": serializers.serialize("json", response), "status": 204}
-    )
+    if isinstance(response, int):
+        return JsonResponse({"message": "transaction updated", "status": 204})
 
 
 @csrf_exempt
@@ -207,23 +219,23 @@ def import_books(request):
         response = requests.get(api_url)
         data = BytesIO(response.content)
         deserialized_data = json.load(data)
-        books = deserialized_data['message']
+        books = deserialized_data["message"]
 
         cleaned_books = []
 
-        keys_mapping = {'  num_pages': 'num_pages', 'bookID': 'id'}
+        keys_mapping = {"  num_pages": "num_pages", "bookID": "id"}
         for book in books:
-            cleaned_book = {keys_mapping.get(key, key): value for key, value in book.items()}
-            cleaned_book['rent'] = 50
+            cleaned_book = {
+                keys_mapping.get(key, key): value for key, value in book.items()
+            }
+            cleaned_book["rent"] = 50
             cleaned_books.append(cleaned_book)
 
-        book_objects = [Book(**book) for book in cleaned_books]
-
-        for book in book_objects:
-            try:
-                book.save()
-            except IntegrityError:
-                pass
+        for book in cleaned_books:
+            b = Book.objects.get_or_create(**book)
+            if b[1] == False:
+                b[0].quantity = 1 + b[0].quantity
+                b[0].save()
 
         return JsonResponse({"message": "Books imported successfully", "status": 201})
 
