@@ -4,6 +4,7 @@ from django.http import HttpResponse, JsonResponse
 from .models import Member, Transaction, Book
 from datetime import datetime
 from django.db import IntegrityError
+from requests.models import PreparedRequest
 
 from django.db.models import F, ExpressionWrapper, fields, Case, When
 from django.utils import timezone
@@ -23,9 +24,8 @@ def index(request):
 @csrf_exempt
 def books_index(request):
     if request.method == "GET":
-        request_body = json.loads(request.body.decode("utf-8"))
-        title = request_body.get("title")
-        author = request_body.get("author")
+        title = request.GET.get("title")
+        author = request.GET.get("author")
 
         books = Book.objects.all()
 
@@ -33,22 +33,26 @@ def books_index(request):
             books = books.filter(title=title)
         if author:
             books = books.filter(authors__contains=author)
-        return JsonResponse({"message": list(books.values()), "status": 200})
+
+        if books:
+            return JsonResponse({"message": list(books.values()), "status": 200})
+        else:
+            return JsonResponse({"message": list(books.values()), "status": 404})
 
     if request.method == "POST":
         request_body = json.loads(request.body.decode("utf-8"))
 
-        title = request_body.get("title")
-        authors = request_body.get("authors")
-        quantity = request_body.get("quantity")
-        rent = request_body.get("rent")
+        books = request_body.get("books")
 
-        response = Book.objects.create(
-            title=title, authors=authors, quantity=quantity, rent=rent
-        )
-        return JsonResponse(
-            {"message": serializers.serialize("json", [response]), "status": 201}
-        )
+        try:
+            for book in books:
+                b = Book.objects.get_or_create(**book)
+                if b[1] == False:
+                    b[0].quantity = 1 + b[0].quantity
+                    b[0].save()
+            return JsonResponse({"message": "books added successfully", "status": 201})
+        except:
+            return JsonResponse({"message": "failed to add books", "status": 409})
 
 
 @csrf_exempt
@@ -194,6 +198,22 @@ def charge_fee(request, member_id):
         return JsonResponse({"message": "transaction updated", "status": 204})
 
 
+def deduplicate_books(books):
+    seen_ids = set()
+    unique_books = []
+    for book in books:
+        if not book["isbn"] in seen_ids:
+            unique_books.append(book)
+            seen_ids.add(book["isbn"])
+    return unique_books
+
+
+def append_page_to_url(api_url, key, value):
+    req = PreparedRequest()
+    req.prepare_url(api_url, {key: value})
+    return req.url
+
+
 @csrf_exempt
 def import_books(request):
     if request.method == "POST":
@@ -203,23 +223,32 @@ def import_books(request):
         isbn = request_body.get("isbn")
         publisher = request_body.get("publisher")
         page = request_body.get("page")
+        quantity = int(request_body.get("quantity"))
 
         api_url = "https://frappe.io/api/method/frappe-library?"
-        if title:
-            api_url = api_url + f"title={title}"
-        if authors:
-            api_url = api_url + f"authors={authors}"
-        if isbn:
-            api_url = api_url + f"isbn={isbn}"
-        if publisher:
-            api_url = api_url + f"publisher={publisher}"
-        if page:
-            api_url = api_url + f"page={page}"
 
-        response = requests.get(api_url)
-        data = BytesIO(response.content)
-        deserialized_data = json.load(data)
-        books = deserialized_data["message"]
+        if title:
+            api_url = append_page_to_url(api_url, "title", title)
+        if authors:
+            api_url = append_page_to_url(api_url, "authors", authors)
+
+        books = []
+
+        page = 1
+        while len(books) < quantity:
+            print("in loop", page, len(books))
+            request_url = append_page_to_url(api_url, "page", page)
+            response = requests.get(request_url)
+            data = BytesIO(response.content)
+            deserialized_data = json.load(data)
+            next_batch = deserialized_data["message"]
+            if not len(next_batch):
+                break
+            books.extend(deserialized_data["message"])
+            books = deduplicate_books(books)
+            page = page + 1
+
+        books = books[0:quantity]
 
         cleaned_books = []
 
@@ -231,13 +260,7 @@ def import_books(request):
             cleaned_book["rent"] = 50
             cleaned_books.append(cleaned_book)
 
-        for book in cleaned_books:
-            b = Book.objects.get_or_create(**book)
-            if b[1] == False:
-                b[0].quantity = 1 + b[0].quantity
-                b[0].save()
-
-        return JsonResponse({"message": "Books imported successfully", "status": 201})
+        return JsonResponse({"message": cleaned_books, "status": 201})
 
 
 # Create your views here.
