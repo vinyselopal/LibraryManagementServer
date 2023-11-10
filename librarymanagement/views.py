@@ -1,9 +1,6 @@
-from django.shortcuts import render
 from io import BytesIO
 from django.http import HttpResponse, JsonResponse
 from .models import Member, Transaction, Book
-from datetime import datetime
-from django.db import IntegrityError
 from requests.models import PreparedRequest
 
 from django.db.models import F, ExpressionWrapper, fields, Case, When
@@ -11,10 +8,10 @@ from django.utils import timezone
 from django.db.models import Sum
 from django.core import serializers
 from django.views.decorators.csrf import csrf_exempt
+from django.db.models.functions import Cast
 
 import json
 import requests
-import copy
 
 
 def index(request):
@@ -79,8 +76,48 @@ def crud_book(request, book_id=None):
 @csrf_exempt
 def members_index(request):
     if request.method == "GET":
+        outstanding_debt = request.GET.get("outstanding_debt")
+
         members = Member.objects.all()
-        return JsonResponse({"message": list(members.values()), "status": 200})
+
+        if outstanding_debt == "true":
+            transaction_fee_queryset = (
+                Transaction.objects.filter(payment_done=False)
+                .annotate(
+                    days_difference=Case(
+                        When(
+                            return_date__isnull=False,
+                            then=Cast(
+                                F("return_date") - F("issue_date"),
+                                fields.IntegerField(),
+                            ),
+                        ),
+                        default=Cast(
+                            timezone.now().date() - F("issue_date"),
+                            fields.IntegerField(),
+                        ),
+                        output_field=fields.IntegerField(),
+                    )
+                )
+                .annotate(
+                    transaction_fee=ExpressionWrapper(
+                        F("days_difference") * F("book__rent"),
+                        output_field=fields.DecimalField(),
+                    )
+                )
+            )
+            outstanding_debt_queryset = (
+                transaction_fee_queryset.select_related("member")
+                .values("member_id")
+                .annotate(debt=Sum("transaction_fee"))
+            )
+
+            members = outstanding_debt_queryset.filter(debt__gt=500)
+
+        if members:
+            return JsonResponse({"message": list(members.values()), "status": 200})
+        else:
+            return JsonResponse({"message": list(members.values()), "status": 404})
 
     if request.method == "POST":
         request_body = json.loads(request.body.decode("utf-8"))
@@ -95,10 +132,12 @@ def members_index(request):
 @csrf_exempt
 def crud_members(request, member_id=None):
     if request.method == "GET":
-        member = Member.objects.get(id=member_id)
-        return JsonResponse(
-            {"message": serializers.serialize("json", [member]), "status": 200}
-        )
+        member = Member.objects.filter(id=member_id)
+
+        if member:
+            return JsonResponse({"message": list(member.values()), "status": 200})
+        else:
+            return JsonResponse({"message": list(member.values()), "status": 404})
 
     if request.method == "PUT":
         request_body = json.loads(request.body.decode("utf-8"))
@@ -113,19 +152,40 @@ def crud_members(request, member_id=None):
 
 
 @csrf_exempt
-def get_outstanding_transactions(request, member_id):
-    response = Transaction.objects.filter(member_id=member_id, return_date=None)
-    return JsonResponse(
-        {"message": serializers.serialize("json", response), "status": 200}
-    )
+def get_transactions(request):
+    book_title = request.GET.get("book_title")
+    book_author = request.GET.get("book_author")
+    issue_date = request.GET.get("issue_date")
+    return_date = request.GET.get("return_date")
+    member_email = request.GET.get("member_email")
+
+    transactions = Transaction.objects.all()
+
+    if member_email:
+        transactions = transactions.filter(member__email=member_email)
+    if return_date:
+        transactions = transactions.filter(return_date=return_date)
+    if issue_date:
+        transactions = transactions.filter(issue_date=issue_date)
+    if book_title:
+        transactions = transactions.filter(book__title=book_title)
+    if book_author:
+        transactions = transactions.filter(book__authors__contains=book_author)
+
+    return JsonResponse({"message": list(transactions.values()), "status": 200})
 
 
 @csrf_exempt
-def issue_book(request, member_id):
+def issue_book(request):
     request_body = json.loads(request.body.decode("utf-8"))
 
-    book_id = request_body.get("book_id")
+    book_title = request_body.get("book_title")
+    book_author = request_body.get("book_author")
     issue_date = request_body.get("issue_date")
+    member_email = request_body.get("member_email")
+
+    member_id = Member.objects.get(email=member_email).id
+    book_id = Book.objects.get(title=book_title, authors__contains=book_author).id
 
     transaction_fee_queryset = Transaction.objects.filter(
         member_id=member_id, payment_done=False
@@ -148,13 +208,8 @@ def issue_book(request, member_id):
     ]
 
     book_quantity = Book.objects.get(id=book_id).quantity
-    print(book_quantity)
     books_issued = Transaction.objects.filter(book_id=book_id, return_date=None).count()
     books_unissued = book_quantity - books_issued
-    # check quantity of the book - no. of times that book is issued
-
-    for t in transaction_fee_queryset:
-        print("t", vars(t))
 
     if transaction_fee_queryset and outstanding_debt > 500:
         return JsonResponse({"message": "Outstanding debt overflow", "status": 409})
@@ -171,31 +226,26 @@ def issue_book(request, member_id):
 
 
 @csrf_exempt
-def return_book(request, member_id):
-    request_body = json.loads(request.body.decode("utf-8"))
+def return_book(request, transaction_id):
+    return_date = timezone.now().date()
 
-    book_id = request_body.get("book_id")
-    return_date = request_body.get("return_date")
-
-    response = Transaction.objects.filter(member_id=member_id, book_id=book_id).update(
-        return_date=return_date
-    )
-    if isinstance(response, int):
-        return JsonResponse({"message": "transaction updated", "status": 204})
+    transaction = Transaction.objects.get(id=transaction_id)
+    if transaction.return_date == None:
+        response = Transaction.objects.filter(id=transaction_id).update(
+            return_date=return_date
+        )
+        if isinstance(response, int):
+            return JsonResponse({"message": "return issued", "status": 204})
+    else:
+        return JsonResponse({"message": "already returned", "status": 400})
 
 
 @csrf_exempt
-def charge_fee(request, member_id):
-    request_body = json.loads(request.body.decode("utf-8"))
-
-    book_id = request_body.get("book_id")
-
-    response = Transaction.objects.filter(member_id=member_id, book_id=book_id).update(
-        payment_done=True
-    )
+def charge_fee(request, transaction_id):
+    response = Transaction.objects.filter(id=transaction_id).update(payment_done=True)
 
     if isinstance(response, int):
-        return JsonResponse({"message": "transaction updated", "status": 204})
+        return JsonResponse({"message": "charged fee", "status": 204})
 
 
 def deduplicate_books(books):
@@ -216,28 +266,24 @@ def append_page_to_url(api_url, key, value):
 
 @csrf_exempt
 def import_books(request):
-    if request.method == "POST":
-        request_body = json.loads(request.body.decode("utf-8"))
-        title = request_body.get("title")
-        authors = request_body.get("authors")
-        isbn = request_body.get("isbn")
-        publisher = request_body.get("publisher")
-        page = request_body.get("page")
-        quantity = int(request_body.get("quantity"))
+    if request.method == "GET":
+        title = request.GET.get("title")
+        author = request.GET.get("author")
+        quantity = int(request.GET.get("quantity"))
 
         api_url = "https://frappe.io/api/method/frappe-library?"
 
         if title:
             api_url = append_page_to_url(api_url, "title", title)
-        if authors:
-            api_url = append_page_to_url(api_url, "authors", authors)
+        if author:
+            api_url = append_page_to_url(api_url, "authors", author)
 
         books = []
 
         page = 1
         while len(books) < quantity:
-            print("in loop", page, len(books))
             request_url = append_page_to_url(api_url, "page", page)
+            print(request_url)
             response = requests.get(request_url)
             data = BytesIO(response.content)
             deserialized_data = json.load(data)
